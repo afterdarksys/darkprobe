@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package darkapi.telemetry.v1;
+
+option go_package = "github.com/straticus1/ads-darkapi-io/darkprobe/pkg/grpcstream";
+
+service DarkProbeTelemetry {
+  // Streams high-speed network telemetry from the darkprobed daemon to the DarkAPI gateway
+  rpc StreamEvents(stream TelemetryEvent) returns (TelemetryResponse) {}
+  
+  // Sends a single high-priority alert (e.g. Rogue AP detected)
+  rpc ReportAlert(Alert) returns (AlertResponse) {}
+}
+
+message TelemetryEvent {
+  string daemon_id = 1;
+  int64 timestamp_ms = 2;
+
+  oneof event {
+    HostDiscovered host_discovered = 3;
+    ConnectionFlow connection_flow = 4;
+    ActiveDirectoryTicket ad_ticket = 5;
+    WirelessBeacon wireless_beacon = 6;
+  }
+}
+
+message HostDiscovered {
+  string ip = 1;
+  string mac = 2;
+  string inferred_os = 3;
+  repeated string open_ports = 4;
+  repeated string hostnames = 5;
+}
+
+message ConnectionFlow {
+  string src_ip = 1;
+  string dst_ip = 2;
+  int32 src_port = 3;
+  int32 dst_port = 4;
+  string protocol = 5;
+  int64 bytes_transferred = 6;
+  float entropy_score = 7;
+}
+
+message ActiveDirectoryTicket {
+  string principal_name = 1;
+  string realm = 2;
+  string ticket_type = 3; // AS-REQ, TGS-REQ
+  string encryption_type = 4;
+}
+
+message WirelessBeacon {
+  string bssid = 1;
+  string ssid = 2;
+  int32 signal_strength_dbm = 3;
+  string encryption_protocol = 4;
+  int32 channel = 5;
+}
+
+message TelemetryResponse {
+  bool success = 1;
+  string message = 2;
+  // The server can stream back dynamic BPF filters or instructions
+  repeated string blocklist_ips = 3;
+}
+
+message Alert {
+  string daemon_id = 1;
+  string alert_type = 2; // ROGUE_AP, C2_BEACON, STEGANOGRAPHY
+  string severity = 3;
+  string description = 4;
+  int64 timestamp_ms = 5;
+}
+
+message AlertResponse {
+  bool acknowledged = 1;
+  string action_taken = 2;
+}

@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package darkprobe;
+
+option go_package = "github.com/straticus1/ads-darkapi-io/darkprobe/proto;proto";
+
+// Service exposing DarkProbe functionality
+service DarkProbeService {
+  // Discover network hosts
+  rpc Discover (DiscoverRequest) returns (DiscoverResponse);
+  // Sniff traffic (streaming responses)
+  rpc Sniff (SniffRequest) returns (stream SniffResponse);
+  // TLS inspection of a domain
+  rpc TLSInspect (TLSInspectRequest) returns (TLSInspectResponse);
+  // Get CDP/LLDP neighbors
+  rpc GetNeighbors (GetNeighborsRequest) returns (GetNeighborsResponse);
+  // Routing protocol RPCs
+  rpc GetRIPInfo (GetRIPInfoRequest) returns (GetRIPInfoResponse);
+  rpc GetBGPInfo (GetBGPInfoRequest) returns (GetBGPInfoResponse);
+  rpc GetOSPFInfo (GetOSPFInfoRequest) returns (GetOSPFInfoResponse);
+}
+
+message DiscoverRequest {
+  string subnet = 1; // CIDR subnet to scan
+}
+
+message HostInfo {
+  string ip = 1;
+  string mac = 2;
+  string os = 3;
+  repeated string open_ports = 4;
+  string hostname = 5;
+}
+
+message DiscoverResponse {
+  repeated HostInfo hosts = 1;
+}
+
+message SniffRequest {
+  string interface = 1;
+  string duration = 2; // duration string e.g. "30s"
+  bool monitor_mode = 3;
+  string wpa_ssid = 4;
+  string wpa_psk = 5;
+}
+
+message SniffResponse {
+  string ip = 1;
+  string mac = 2;
+  string os = 3;
+  repeated string l7_protocols = 4;
+  repeated string hostnames = 5;
+}
+
+message TLSInspectRequest {
+  string domain = 1;
+  int32 port = 2;
+}
+
+message TLSInspectResponse {
+  string result = 1; // JSON or text summary of inspection
+}
+
+// Neighbor discovery messages
+message NeighborInfo {
+  string chassis_id = 1;
+  string port_id = 2;
+  string system_name = 3;
+  string management_ip = 4;
+  repeated string capabilities = 5;
+  enum Protocol { CDP = 0; LLDP = 1; }
+  Protocol protocol = 6;
+}
+
+message GetNeighborsRequest {
+  string interface = 1;
+}
+
+message GetNeighborsResponse {
+  repeated NeighborInfo neighbors = 1;
+}
+// Routing protocol messages
+message RIPInfo {
+  string source = 1;
+  string destination = 2;
+  uint32 metric = 3;
+}
+
+message BGPInfo {
+  uint32 asn = 1;
+  string neighbor_ip = 2;
+  repeated string nlri = 3;
+}
+
+message OSPFInfo {
+  string router_id = 1;
+  string area_id = 2;
+  string lsa_type = 3;
+}
+
+message GetRIPInfoRequest {}
+message GetRIPInfoResponse { repeated RIPInfo rip_infos = 1; }
+
+message GetBGPInfoRequest {}
+message GetBGPInfoResponse { repeated BGPInfo bgp_infos = 1; }
+
+message GetOSPFInfoRequest {}
+message GetOSPFInfoResponse { repeated OSPFInfo ospf_infos = 1; }

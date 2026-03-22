@@ -1,0 +1,20 @@
+  What DarkProbe CANNOT do:
+  - ❌ Decrypt WPA2-PSK encrypted data frames (requires passphrase +
+  handshake + decryption logic)
+  - ❌ Decrypt WPA2-Enterprise traffic (per-session keys from RADIUS/EAP)
+  - ❌ Decrypt WPA3-SAE traffic (Simultaneous Authentication of Equals)
+  - ❌ Extract WPA-Enterprise credentials (would need RADIUS MitM)
+  - ❌ Put wireless interfaces into monitor mode programmatically
+
+  Current Wireless Capabilities:
+  The tool can passively observe:
+  1. Unencrypted 802.11 management/control frames
+  2. EAPOL authentication exchanges (handshakes)
+  3. Post-authentication unencrypted traffic (if any)
+
+  Would you like me to add WPA2 decryption support? This would require:
+  - Capturing the 4-way handshake
+  - Accepting a PSK/passphrase
+  - Implementing PBKDF2 + AES-CCMP decryption
+  - Monitor mode interface management
+
