@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/hmac"
 	"crypto/sha1"
@@ -109,12 +110,12 @@ func (w *WPADecrypter) ProcessEAPOL(dot11 *layers.Dot11, eapol *layers.EAPOL) {
 		// Calculate PTK
 		minMac := clientMAC[:]
 		maxMac := apMAC[:]
-		if string(minMac) > string(maxMac) {
+		if bytes.Compare(minMac, maxMac) > 0 {
 			minMac, maxMac = maxMac, minMac
 		}
 		minNonce := state.SNonce
 		maxNonce := state.ANonce
-		if string(minNonce) > string(maxNonce) {
+		if bytes.Compare(minNonce, maxNonce) > 0 {
 			minNonce, maxNonce = maxNonce, minNonce
 		}
 		

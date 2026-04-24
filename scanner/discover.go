@@ -10,39 +10,53 @@ import (
 	"time"
 )
 
-// Host represents a discovered network host
+// Host represents a discovered network host.
 type Host struct {
 	IP        string `json:"ip"`
+	MAC       string `json:"mac,omitempty"`
 	Hostname  string `json:"hostname,omitempty"`
 	OS        string `json:"os,omitempty"`
 	OpenPorts []int  `json:"open_ports,omitempty"`
 }
 
-// DiscoverNetwork scans the local subnet for active hosts and open ports
-func DiscoverNetwork(ctx context.Context, subnet string) ([]Host, error) {
-	// Parse the subnet
-	ip, ipnet, err := net.ParseCIDR(subnet)
+// DiscoverOptions controls scan behaviour. Pass nil to use defaults.
+type DiscoverOptions struct {
+	Concurrency int   // concurrent workers (default 100)
+	Ports       []int // ports to probe (default: common set)
+}
+
+var defaultPorts = []int{22, 80, 135, 139, 443, 445, 3389}
+
+// DiscoverNetwork scans a subnet for active hosts via TCP port probing.
+func DiscoverNetwork(ctx context.Context, subnet string, opts *DiscoverOptions) ([]Host, error) {
+	concurrency := 100
+	ports := defaultPorts
+	if opts != nil {
+		if opts.Concurrency > 0 {
+			concurrency = opts.Concurrency
+		}
+		if len(opts.Ports) > 0 {
+			ports = opts.Ports
+		}
+	}
+
+	_, ipnet, err := net.ParseCIDR(subnet)
 	if err != nil {
 		return nil, fmt.Errorf("invalid subnet: %w", err)
 	}
 
 	var ips []string
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
+	for ip := cloneIP(ipnet.IP.Mask(ipnet.Mask)); ipnet.Contains(ip); incIP(ip) {
 		ips = append(ips, ip.String())
 	}
-	// Remove network and broadcast address for simplicity (IPv4 assumed)
+	// Drop network and broadcast addresses (IPv4).
 	if len(ips) > 2 {
 		ips = ips[1 : len(ips)-1]
 	}
 
 	hostsCh := make(chan Host, len(ips))
 	var wg sync.WaitGroup
-
-	// Common ports to check for OS discovery
-	portsToCheck := []int{22, 80, 135, 139, 443, 445, 3389}
-
-	// Rate limiter/worker pool size
-	sem := make(chan struct{}, 100)
+	sem := make(chan struct{}, concurrency)
 
 	for _, targetIP := range ips {
 		wg.Add(1)
@@ -51,21 +65,19 @@ func DiscoverNetwork(ctx context.Context, subnet string) ([]Host, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Quick ping attempt via TCP (port 22, 135, 445)
-			openPorts := scanPorts(tip, portsToCheck)
-			if len(openPorts) > 0 {
-				host := Host{
-					IP:        tip,
-					OpenPorts: openPorts,
-					OS:        guessOS(openPorts, tip),
-				}
-				// Try reverse DNS
-				names, _ := net.LookupAddr(tip)
-				if len(names) > 0 {
-					host.Hostname = names[0]
-				}
-				hostsCh <- host
+			openPorts := scanPorts(tip, ports)
+			if len(openPorts) == 0 {
+				return
 			}
+			host := Host{
+				IP:        tip,
+				OpenPorts: openPorts,
+				OS:        guessOS(openPorts, tip),
+			}
+			if names, _ := net.LookupAddr(tip); len(names) > 0 {
+				host.Hostname = names[0]
+			}
+			hostsCh <- host
 		}(targetIP)
 	}
 
@@ -76,32 +88,30 @@ func DiscoverNetwork(ctx context.Context, subnet string) ([]Host, error) {
 	for h := range hostsCh {
 		results = append(results, h)
 	}
-	
-	// Sort by IP for consistent output
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].IP < results[j].IP
 	})
-
 	return results, nil
 }
 
 func scanPorts(ip string, ports []int) []int {
-	var open []int
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
+	var (
+		open []int
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+	)
 	for _, port := range ports {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			target := fmt.Sprintf("%s:%d", ip, p)
-			conn, err := net.DialTimeout("tcp", target, 800*time.Millisecond)
-			if err == nil {
-				conn.Close()
-				mu.Lock()
-				open = append(open, p)
-				mu.Unlock()
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, p), 800*time.Millisecond)
+			if err != nil {
+				return
 			}
+			conn.Close()
+			mu.Lock()
+			open = append(open, p)
+			mu.Unlock()
 		}(port)
 	}
 	wg.Wait()
@@ -118,37 +128,28 @@ func guessOS(openPorts []int, ip string) string {
 		}
 		return false
 	}
-
 	if hasPort(445) || hasPort(135) || hasPort(3389) {
 		return "Windows"
 	}
 	if hasPort(22) {
-		// Read banner for granular detection
 		banner := grabBanner(ip, 22)
-		if banner != "" {
-			if strings.Contains(banner, "Ubuntu") {
-				return "Ubuntu Linux"
-			}
-			if strings.Contains(banner, "Debian") {
-				return "Debian Linux"
-			}
+		if strings.Contains(banner, "Ubuntu") {
+			return "Ubuntu Linux"
+		}
+		if strings.Contains(banner, "Debian") {
+			return "Debian Linux"
 		}
 		return "Linux/Unix"
 	}
-	
-	// Default
 	return "Unknown"
 }
 
 func grabBanner(ip string, port int) string {
-	target := fmt.Sprintf("%s:%d", ip, port)
-	conn, err := net.DialTimeout("tcp", target, 1*time.Second)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 1*time.Second)
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
-	
-	// Set a deadline for reading
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
@@ -158,7 +159,14 @@ func grabBanner(ip string, port int) string {
 	return string(buf[:n])
 }
 
-func inc(ip net.IP) {
+// cloneIP returns a copy of ip so we can safely increment it without aliasing.
+func cloneIP(ip net.IP) net.IP {
+	clone := make(net.IP, len(ip))
+	copy(clone, ip)
+	return clone
+}
+
+func incIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
 		if ip[j] > 0 {

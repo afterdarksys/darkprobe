@@ -11,7 +11,7 @@ import (
 
 // TestSIPOptions sends an active SIP OPTIONS request to discover PBX footprints
 func TestSIPOptions(target string, port int, udp bool) error {
-	addr := fmt.Sprintf("%s:%d", target, port)
+	addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
 	log.Printf("Starting SIP OPTIONS Ping against %s (UDP: %v)", addr, udp)
 
 	protoStr := "TCP"

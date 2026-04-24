@@ -56,7 +56,7 @@ type server struct {
 }
 
 func (s *server) Discover(ctx context.Context, req *pb.DiscoverRequest) (*pb.DiscoverResponse, error) {
-    hosts, err := scanner.DiscoverNetwork(ctx, req.Subnet)
+    hosts, err := scanner.DiscoverNetwork(ctx, req.Subnet, nil)
     if err != nil {
         return nil, err
     }
@@ -92,8 +92,10 @@ func (s *server) Sniff(req *pb.SniffRequest, stream pb.DarkProbeService_SniffSer
 }
 
 func (s *server) TLSInspect(ctx context.Context, req *pb.TLSInspectRequest) (*pb.TLSInspectResponse, error) {
-    result := fmt.Sprintf("TLS inspection for %s:%d not implemented in daemon", req.Domain, req.Port)
-    return &pb.TLSInspectResponse{Result: result}, nil
+    if err := scanner.DebugTLS(req.Domain, int(req.Port)); err != nil {
+        return nil, fmt.Errorf("TLS inspection failed: %v", err)
+    }
+    return &pb.TLSInspectResponse{Result: fmt.Sprintf("TLS inspection of %s:%d complete (details in daemon log)", req.Domain, req.Port)}, nil
 }
 
 func main() {

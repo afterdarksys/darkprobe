@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"strings"
@@ -13,45 +14,48 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-// PassiveHost tracks passively discovered information
+// PassiveHost tracks passively discovered information about a host.
 type PassiveHost struct {
 	IP          string   `json:"ip"`
 	MAC         string   `json:"mac,omitempty"`
 	InferredOS  string   `json:"os,omitempty"`
 	L7Protocols []string `json:"l7_protocols,omitempty"`
-	Hostnames   []string `json:"hostnames,omitempty"` // from reverse DNS or TLS SNI/HTTP Host
+	Hostnames   []string `json:"hostnames,omitempty"`
 }
 
+// PassiveScanner accumulates host intelligence from captured packets.
 type PassiveScanner struct {
-	hosts          map[string]*PassiveHost
-	neighbors      []NeighborInfo
-	// Routing protocol data
-	ripInfos       []RIPInfo
-	bgpPeers       []BGPInfo
-	ospfNeighbors  []OSPFInfo
-	mu             sync.Mutex
+	hosts         map[string]*PassiveHost
+	neighbors     []NeighborInfo
+	ripInfos      []RIPInfo
+	bgpPeers      []BGPInfo
+	ospfNeighbors []OSPFInfo
+	mu            sync.Mutex
 	starlarkEngine *StarlarkEngine
-	wpaDecrypter   *WPADecrypter
+	starlarkSem   chan struct{} // bounds concurrent Starlark goroutines
+	wpaDecrypter  *WPADecrypter
 }
 
+// NewPassiveScanner returns an initialised PassiveScanner.
+func NewPassiveScanner(engine *StarlarkEngine) *PassiveScanner {
+	return &PassiveScanner{
+		hosts:          make(map[string]*PassiveHost),
+		neighbors:      []NeighborInfo{},
+		ripInfos:       []RIPInfo{},
+		bgpPeers:       []BGPInfo{},
+		ospfNeighbors:  []OSPFInfo{},
+		starlarkEngine: engine,
+		starlarkSem:    make(chan struct{}, 16),
+	}
+}
+
+// EnableWPA2Decryption arms the scanner to decrypt WPA2-PSK traffic.
 func (ps *PassiveScanner) EnableWPA2Decryption(ssid, passphrase string) error {
 	ps.wpaDecrypter = NewWPADecrypter(ssid, passphrase)
 	return nil
 }
 
-func NewPassiveScanner(engine *StarlarkEngine) *PassiveScanner {
-	return &PassiveScanner{
-		hosts:          make(map[string]*PassiveHost),
-		neighbors:      []NeighborInfo{},
-		// initialize routing slices
-		ripInfos:      []RIPInfo{},
-		bgpPeers:       []BGPInfo{},
-		ospfNeighbors:  []OSPFInfo{},
-		starlarkEngine: engine,
-	}
-}
-
-// SniffNetwork listens on the interface for the given duration and returns discovered hosts
+// SniffNetwork listens on iface for duration and returns discovered hosts.
 func (ps *PassiveScanner) SniffNetwork(ctx context.Context, iface string, duration time.Duration, monitorMode bool) ([]PassiveHost, error) {
 	inactive, err := pcap.NewInactiveHandle(iface)
 	if err != nil {
@@ -60,24 +64,17 @@ func (ps *PassiveScanner) SniffNetwork(ctx context.Context, iface string, durati
 	defer inactive.CleanUp()
 
 	if monitorMode {
-		err = inactive.SetRFMon(true)
-		if err != nil {
+		if err = inactive.SetRFMon(true); err != nil {
 			log.Printf("Warning: failed to set monitor mode: %v", err)
 		}
 	}
-
-	err = inactive.SetSnapLen(1600)
-	if err != nil {
+	if err = inactive.SetSnapLen(1600); err != nil {
 		return nil, err
 	}
-
-	err = inactive.SetPromisc(true)
-	if err != nil {
+	if err = inactive.SetPromisc(true); err != nil {
 		return nil, err
 	}
-
-	err = inactive.SetTimeout(pcap.BlockForever)
-	if err != nil {
+	if err = inactive.SetTimeout(pcap.BlockForever); err != nil {
 		return nil, err
 	}
 
@@ -88,11 +85,9 @@ func (ps *PassiveScanner) SniffNetwork(ctx context.Context, iface string, durati
 	defer handle.Close()
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	
 	log.Printf("Listening passively on %s for %v...", iface, duration)
 
 	timeout := time.After(duration)
-	
 	for {
 		select {
 		case <-ctx.Done():
@@ -117,13 +112,13 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 	var isWireless bool
 	var detectedProtos []string
 
-	// Decode L2 (Ethernet or 802.11)
+	// ── L2: Ethernet or 802.11 ──────────────────────────────────────────────
 	if dot11Layer := packet.Layer(layers.LayerTypeDot11); dot11Layer != nil {
 		dot11, _ := dot11Layer.(*layers.Dot11)
-		srcMAC = dot11.Address2.String() // Address2 is typically the transmitter/source
+		srcMAC = dot11.Address2.String()
 		isWireless = true
 		detectedProtos = append(detectedProtos, "802.11")
-		
+
 		if ps.wpaDecrypter != nil {
 			if eapolLayer := packet.Layer(layers.LayerTypeEAPOL); eapolLayer != nil {
 				eapol, _ := eapolLayer.(*layers.EAPOL)
@@ -131,16 +126,14 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 			} else if dataLayer := packet.Layer(layers.LayerTypeDot11Data); dataLayer != nil && dot11.Flags.WEP() {
 				decrypted, err := ps.wpaDecrypter.DecryptPacket(dot11, dataLayer.LayerPayload())
 				if err == nil && len(decrypted) > 0 {
-					version := decrypted[0] >> 4
-					if version == 4 {
-						newPacket := gopacket.NewPacket(decrypted, layers.LayerTypeIPv4, gopacket.Default)
-						if newPacket.Layer(layers.LayerTypeIPv4) != nil {
-							packet = newPacket
+					switch decrypted[0] >> 4 {
+					case 4:
+						if np := gopacket.NewPacket(decrypted, layers.LayerTypeIPv4, gopacket.Default); np.Layer(layers.LayerTypeIPv4) != nil {
+							packet = np
 						}
-					} else if version == 6 {
-						newPacket := gopacket.NewPacket(decrypted, layers.LayerTypeIPv6, gopacket.Default)
-						if newPacket.Layer(layers.LayerTypeIPv6) != nil {
-							packet = newPacket
+					case 6:
+						if np := gopacket.NewPacket(decrypted, layers.LayerTypeIPv6, gopacket.Default); np.Layer(layers.LayerTypeIPv6) != nil {
+							packet = np
 						}
 					}
 				}
@@ -151,20 +144,12 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 		srcMAC = eth.SrcMAC.String()
 	}
 
-	// 802.1x (EAPOL) Authentication Frames
-	if eapolLayer := packet.Layer(layers.LayerTypeEAPOL); eapolLayer != nil {
+	// 802.1X EAPOL frames
+	if packet.Layer(layers.LayerTypeEAPOL) != nil {
 		detectedProtos = append(detectedProtos, "802.1X (EAPOL)")
 	}
 
-	// CDP / LLDP parsing
-	// CDP/LLDP parsing not supported in current gopacket version; placeholder for future implementation
-// if cdpLayer := packet.Layer(layers.LayerTypeCDP); cdpLayer != nil {
-// 	// ... CDP handling ...
-// } else if lldpLayer := packet.Layer(layers.LayerTypeLLDP); lldpLayer != nil {
-// 	// ... LLDP handling ...
-// }
-
-	// Decode L3
+	// ── L3 ───────────────────────────────────────────────────────────────────
 	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 		ip, _ := ipLayer.(*layers.IPv4)
 		srcIP = ip.SrcIP.String()
@@ -176,8 +161,8 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 		dstIP = ip.DstIP.String()
 		ttl = ip.HopLimit
 	} else {
-		// If it's pure L2 (like an EAPOL frame without an IP yet), we might track it by MAC
-		if srcMAC != "" && srcIP == "" {
+		// Pure L2 frame (e.g. bare EAPOL) — track by MAC if available.
+		if srcMAC != "" {
 			srcIP = "MAC:" + srcMAC
 		} else {
 			return
@@ -195,38 +180,43 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 		ps.addProtocol(host, proto)
 	}
 
-	// Decode L4 (TCP/UDP) & Passive OS Fingerprinting on SYN packets
+	// ── L4: TCP ──────────────────────────────────────────────────────────────
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 		tcp, _ := tcpLayer.(*layers.TCP)
-		
-		// If it's a SYN packet, analyze it for OS fingerprinting
+
+		// Passive OS fingerprinting from TCP SYN.
 		if tcp.SYN && !tcp.ACK && host.InferredOS == "" {
 			host.InferredOS = fingerprintOS(ttl, tcp.Window, tcp.Options)
 		}
 
-		// L7 Decoding (HTTP/TLS)
 		if app := packet.ApplicationLayer(); app != nil {
-			payload := string(app.Payload())
-			if strings.HasPrefix(payload, "GET ") || strings.HasPrefix(payload, "POST ") {
+			payload := app.Payload()
+			payloadStr := string(payload)
+			if strings.HasPrefix(payloadStr, "GET ") || strings.HasPrefix(payloadStr, "POST ") ||
+				strings.HasPrefix(payloadStr, "PUT ") || strings.HasPrefix(payloadStr, "HTTP/") {
 				ps.addProtocol(host, "HTTP")
-				// Try to extract Host header
-				lines := strings.Split(payload, "\r\n")
-				for _, line := range lines {
+				for _, line := range strings.Split(payloadStr, "\r\n") {
 					if strings.HasPrefix(line, "Host: ") {
-						hname := strings.TrimSpace(strings.TrimPrefix(line, "Host: "))
-						ps.addHostname(host, hname)
+						ps.addHostname(host, strings.TrimSpace(strings.TrimPrefix(line, "Host: ")))
 					}
 				}
 			} else if tcp.DstPort == 443 || tcp.SrcPort == 443 {
-				// We don't have a full TLS parser here, but we can tag it as TLS
 				ps.addProtocol(host, "TLS")
+				// Extract SNI from TLS ClientHello so we capture the target hostname.
+				if sni := extractTLSSNI(payload); sni != "" {
+					ps.addHostname(host, sni)
+				}
 			}
+		} else if tcp.DstPort == 443 || tcp.SrcPort == 443 {
+			ps.addProtocol(host, "TLS")
 		}
+
+	// ── L4: UDP ──────────────────────────────────────────────────────────────
 	} else if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 		udp, _ := udpLayer.(*layers.UDP)
+		ps.addProtocol(host, "UDP")
 		if udp.DstPort == 53 || udp.SrcPort == 53 {
 			ps.addProtocol(host, "DNS")
-			// Hooking DNS Layer
 			if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
 				dns, _ := dnsLayer.(*layers.DNS)
 				for _, q := range dns.Questions {
@@ -234,61 +224,97 @@ func (ps *PassiveScanner) processPacket(packet gopacket.Packet) {
 				}
 			}
 		}
-	// Placeholder for future routing protocol parsing (RIP, BGP, OSPF) – not supported by current gopacket version
-// TODO: implement custom parsing if needed
 
+	// ── L4: ICMP ─────────────────────────────────────────────────────────────
+	} else if packet.Layer(layers.LayerTypeICMPv4) != nil {
 		ps.addProtocol(host, "ICMP")
 		if app := packet.ApplicationLayer(); app != nil {
-			payload := string(app.Payload())
-			if len(payload) > 64 {
-				entropy := CalculateShannonEntropy(payload)
+			icmpPayload := string(app.Payload())
+			if len(icmpPayload) > 64 {
+				entropy := CalculateShannonEntropy(icmpPayload)
 				if entropy > 4.8 {
-					log.Printf("[ANOMALY] High Entropy ICMP Payload (Steganography/Exfil) from %s: %.2f", srcIP, entropy)
-					ps.addProtocol(host, fmt.Sprintf("ICMP Tunneling / C2 (Entropy: %.2f)", entropy))
+					log.Printf("[ANOMALY] High-entropy ICMP payload from %s (entropy=%.2f) — possible tunnelling/exfil", srcIP, entropy)
+					ps.addProtocol(host, fmt.Sprintf("ICMP Tunneling/C2 (entropy=%.2f)", entropy))
 				}
 			}
 		}
 	}
 
-	if errLayer := packet.ErrorLayer(); errLayer != nil {
-		if ps.starlarkEngine != nil {
-			go ps.starlarkEngine.EvalMalformed(srcIP, srcMAC, fmt.Sprintf("%v", errLayer.Error()))
+	// Pass malformed packets to Starlark plugins (bounded goroutines).
+	if errLayer := packet.ErrorLayer(); errLayer != nil && ps.starlarkEngine != nil {
+		errMsg := fmt.Sprintf("%v", errLayer.Error())
+		select {
+		case ps.starlarkSem <- struct{}{}:
+			go func() {
+				defer func() { <-ps.starlarkSem }()
+				ps.starlarkEngine.EvalMalformed(srcIP, srcMAC, errMsg)
+			}()
+		default:
 		}
 	}
 
-	_ = dstIP // could track flows, but focusing on host discovery
+	_ = dstIP
 }
 
-// addNeighbor adds a discovered neighbor, deduplicating by chassis+port+protocol.
-// Duplicate GetNeighbors method removed; use implementation from neighbor.go
-
-// Helper methods for routing protocol data
-func (ps *PassiveScanner) addRIPInfo(info RIPInfo) {
-    for _, existing := range ps.ripInfos {
-        if existing.Source == info.Source && existing.Destination == info.Destination {
-            return
-        }
-    }
-    ps.ripInfos = append(ps.ripInfos, info)
+// extractTLSSNI parses a TLS ClientHello and returns the SNI value, or "" if
+// the record is not a ClientHello or does not contain an SNI extension.
+func extractTLSSNI(payload []byte) string {
+	// TLS record layer: ContentType(1) + Version(2) + Length(2)
+	if len(payload) < 5 || payload[0] != 0x16 {
+		return ""
+	}
+	// Handshake layer: HandshakeType(1) + Length(3), starts at byte 5.
+	if len(payload) < 9 || payload[5] != 0x01 { // 0x01 = ClientHello
+		return ""
+	}
+	offset := 9 // start of ClientHello body
+	// ProtocolVersion(2) + Random(32)
+	offset += 2 + 32
+	if len(payload) <= offset {
+		return ""
+	}
+	// SessionID
+	sessionIDLen := int(payload[offset])
+	offset += 1 + sessionIDLen
+	if len(payload) < offset+2 {
+		return ""
+	}
+	// CipherSuites
+	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2 + cipherSuitesLen
+	if len(payload) < offset+1 {
+		return ""
+	}
+	// CompressionMethods
+	compressionLen := int(payload[offset])
+	offset += 1 + compressionLen
+	// Extensions
+	if len(payload) < offset+2 {
+		return ""
+	}
+	extTotalLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+	end := offset + extTotalLen
+	for offset+4 <= end && offset+4 <= len(payload) {
+		extType := binary.BigEndian.Uint16(payload[offset:])
+		extDataLen := int(binary.BigEndian.Uint16(payload[offset+2:]))
+		offset += 4
+		if offset+extDataLen > len(payload) {
+			break
+		}
+		if extType == 0x0000 && extDataLen >= 5 { // SNI extension
+			// ServerNameList: length(2) + NameType(1) + NameLength(2) + Name
+			nameLen := int(binary.BigEndian.Uint16(payload[offset+3:]))
+			if offset+5+nameLen <= len(payload) {
+				return string(payload[offset+5 : offset+5+nameLen])
+			}
+		}
+		offset += extDataLen
+	}
+	return ""
 }
 
-func (ps *PassiveScanner) addBGPInfo(info BGPInfo) {
-    for _, existing := range ps.bgpPeers {
-        if existing.Asn == info.Asn && existing.NeighborIp == info.NeighborIp {
-            return
-        }
-    }
-    ps.bgpPeers = append(ps.bgpPeers, info)
-}
-
-func (ps *PassiveScanner) addOSPFInfo(info OSPFInfo) {
-    for _, existing := range ps.ospfNeighbors {
-        if existing.RouterId == info.RouterId && existing.AreaId == info.AreaId {
-            return
-        }
-    }
-    ps.ospfNeighbors = append(ps.ospfNeighbors, info)
-}
+// ── Helper methods ────────────────────────────────────────────────────────────
 
 func (ps *PassiveScanner) addNeighbor(ni NeighborInfo) {
 	for _, existing := range ps.neighbors {
@@ -299,26 +325,49 @@ func (ps *PassiveScanner) addNeighbor(ni NeighborInfo) {
 	ps.neighbors = append(ps.neighbors, ni)
 }
 
+func (ps *PassiveScanner) addRIPInfo(info RIPInfo) {
+	for _, existing := range ps.ripInfos {
+		if existing.Source == info.Source && existing.Destination == info.Destination {
+			return
+		}
+	}
+	ps.ripInfos = append(ps.ripInfos, info)
+}
+
+func (ps *PassiveScanner) addBGPInfo(info BGPInfo) {
+	for _, existing := range ps.bgpPeers {
+		if existing.Asn == info.Asn && existing.NeighborIp == info.NeighborIp {
+			return
+		}
+	}
+	ps.bgpPeers = append(ps.bgpPeers, info)
+}
+
+func (ps *PassiveScanner) addOSPFInfo(info OSPFInfo) {
+	for _, existing := range ps.ospfNeighbors {
+		if existing.RouterId == info.RouterId && existing.AreaId == info.AreaId {
+			return
+		}
+	}
+	ps.ospfNeighbors = append(ps.ospfNeighbors, info)
+}
+
 func fingerprintOS(ttl uint8, windowSize uint16, options []layers.TCPOption) string {
-	// Passive OS fingerprinting heuristics
-	// TTLs are typically initial values of 64 (Linux/Mac) or 128 (Windows) or 255 (Cisco/Network eq)
-	// We round up to nearest typical boundary due to hops
-	initialTTL := guessInitialTTL(ttl)
-	
-	if initialTTL == 128 {
+	switch guessInitialTTL(ttl) {
+	case 128:
 		if windowSize == 8192 || windowSize == 64240 {
 			return "Windows"
 		}
 		return "Windows (Generic)"
-	} else if initialTTL == 64 {
+	case 64:
 		if windowSize == 65535 {
 			return "macOS / iOS / FreeBSD"
-		} else if windowSize == 5840 || windowSize == 29200 || windowSize == 64240 {
+		}
+		if windowSize == 5840 || windowSize == 29200 || windowSize == 64240 {
 			return "Linux"
 		}
 		return "Linux/Unix"
 	}
-	
 	return fmt.Sprintf("Unknown (TTL:%d, Win:%d)", ttl, windowSize)
 }
 
@@ -340,19 +389,27 @@ func (ps *PassiveScanner) getOrCreateHost(ip string) *PassiveHost {
 	return h
 }
 
+// addProtocol appends proto to the host's protocol list (deduplicating), then
+// fires any loaded Starlark plugins asynchronously with a bounded semaphore.
 func (ps *PassiveScanner) addProtocol(h *PassiveHost, proto string) {
-	added := false
 	for _, p := range h.L7Protocols {
 		if p == proto {
 			return
 		}
 	}
 	h.L7Protocols = append(h.L7Protocols, proto)
-	added = true
 
-	// If we have a programmable script loaded, let it evaluate the host asynchronously
-	if added && ps.starlarkEngine != nil {
-		go ps.starlarkEngine.EvalPassiveHost(*h)
+	if ps.starlarkEngine != nil {
+		snapshot := *h // copy before goroutine
+		select {
+		case ps.starlarkSem <- struct{}{}:
+			go func() {
+				defer func() { <-ps.starlarkSem }()
+				ps.starlarkEngine.EvalPassiveHost(snapshot)
+			}()
+		default:
+			// semaphore full; skip this evaluation rather than unbounded growth
+		}
 	}
 }
 
@@ -367,13 +424,9 @@ func (ps *PassiveScanner) addHostname(h *PassiveHost, hostname string) {
 	}
 	h.Hostnames = append(h.Hostnames, hostname)
 
-	// Anomaly Detection: DGA Check
 	if isDGA, entropy := IsDGA(hostname); isDGA {
-		// Log alerting metadata
-		log.Printf("[ANOMALY] High Entropy DGA Detected: %s (Entropy: %.2f) from %s", hostname, entropy, h.IP)
-		
-		// Map as a suspicious protocol/behavior
-		ps.addProtocol(h, fmt.Sprintf("Malware C2 (DGA: %.2f)", entropy))
+		log.Printf("[ANOMALY] DGA domain detected: %s (entropy=%.2f) from %s", hostname, entropy, h.IP)
+		ps.addProtocol(h, fmt.Sprintf("Malware C2 (DGA entropy=%.2f)", entropy))
 	}
 }
 
